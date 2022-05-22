@@ -11,18 +11,18 @@
 // ------ settings ------
 
 // my mac addr: de:ad:be:ef:co:fe
-#define def_my_mac 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+#define def_my_mac 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // src MAC  (MY 10G-INTERFACE MAC) [CHANGE-ME]
 static uint8_t my_mac[] = { def_my_mac };
 
 // gateway mac addr: 00:00:00:00:00:00 
-#define def_gw_mac 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // Gateway
+#define def_gw_mac 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // dst MAC  (GATEWAY MAC)  [CHANGE-ME]
 
 
-#define def_my_ip    0, 0, 0, 0
+#define def_my_ip    0, 0, 0, 0  //  [CHANGE-ME]
 static uint8_t my_ip[] = { def_my_ip };
 
 #define def_src_port 0x12, 0x34
-#define def_dst_port 0x00, 80
+#define def_dst_port 0x00, 80   // HTTP80  [CHANGE-ME]
 
 
 // constants
@@ -63,11 +63,11 @@ static const uint8_t arp_reply[] = {
 	0x00, 0x01,                         // Hardware Type Ethernet
 	0x08, 0x00,                         // Protocol Type: IPv4
 	0x06, 0x04,                         // Hardware size, Protocol size
-	0x00, 0x02,                         // Opcode: reply; 0x00, 0x01 = request
+	0x00, 0x02,                         // Opcode: reply; 0x00, 0x01 = request; 0x00, 0x02 = response;
 	def_my_mac,			    // sender mac, my mac
 	def_my_ip, 		            // my IP addr
-	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // target/dst MAC
-	0x11, 0x11, 0x11, 0x11              // Target/dst IP addr
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // target/dst MAC          (Overwritten on the fly)
+	0x11, 0x11, 0x11, 0x11              // Target/dst IP addr      (Overwritten on the fly)
 };
 
 // default arp reply
@@ -198,6 +198,28 @@ uint32_t ip_count(uint32_t* gcnt) {
 	return *gcnt;
 }
 
+static double diff_mpps(uint64_t pkts_new, uint64_t pkts_old, uint64_t nanos) {
+        return (double) (pkts_new - pkts_old) / 1000000.0 / ((double) nanos / 1000000000.0);
+}
+
+static uint32_t diff_mbit(uint64_t bytes_new, uint64_t bytes_old, uint64_t pkts_new, uint64_t pkts_old, uint64_t nanos) {
+        // take stuff on the wire into account, i.e., the preamble, SFD and IFG (20 bytes)
+        // otherwise it won't show up as 10000 mbit/s with small packets which is confusing
+        return (uint32_t) (((bytes_new - bytes_old) / 1000000.0 / ((double) nanos / 1000000000.0)) * 8
+                + diff_mpps(pkts_new, pkts_old, nanos) * 20 * 8);
+}
+
+void print_stats_diff_stderr(struct device_stats* stats_new, struct device_stats* stats_old, uint64_t nanos) {
+        fprintf(stderr, "[%s] RX: %d Mbit/s %.2f Mpps\n", stats_new->device ? stats_new->device->pci_addr : "???",
+                diff_mbit(stats_new->rx_bytes, stats_old->rx_bytes, stats_new->rx_pkts, stats_old->rx_pkts, nanos),
+                diff_mpps(stats_new->rx_pkts, stats_old->rx_pkts, nanos)
+        );
+        fprintf(stderr, "[%s] TX: %d Mbit/s %.2f Mpps\n", stats_new->device ? stats_new->device->pci_addr : "???",
+                diff_mbit(stats_new->tx_bytes, stats_old->tx_bytes, stats_new->tx_pkts, stats_old->tx_pkts, nanos),
+                diff_mpps(stats_new->tx_pkts, stats_old->tx_pkts, nanos)
+        );
+}
+
 
 int main(int argc, char* argv[]) {
 	if (argc < 2 || argc > 3) {
@@ -205,8 +227,8 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
-	struct mempool* mempool = memory_allocate_mempool(NUM_BUFS, 0);
 	struct ixy_device* dev = ixy_init(argv[1], 1, 1, 0);
+	struct mempool* mempool = memory_allocate_mempool(NUM_BUFS, 0);
 
 	uint32_t global_ip_cnt = 0;
 
@@ -277,7 +299,7 @@ skip_send:
 			if (time - last_stats_printed > ONE_SECOND) {
 				// every second
 				ixy_read_stats(dev, &stats);
-				print_stats_diff(&stats, &stats_old, time - last_stats_printed);
+				print_stats_diff_stderr(&stats, &stats_old, time - last_stats_printed);
 				fprintf(stderr, "Status: %.02f%%\n", ((float) global_ip_cnt)/ ((float) 0xFFFFFFFF) *100);
 				stats_old = stats;
 				last_stats_printed = time;
@@ -317,7 +339,6 @@ skip_send:
 //                              printf("%02x", (rbufs[i]->data)[pcur]);
 //                      }
 //			printf("\n");
-
 				if (rbufs[i]->data[OFFSET_ETH_TYPE] == 0x08 && 
 					rbufs[i]->data[OFFSET_ETH_TYPE +1] == 0x06 &&
 					rbufs[i]->data[OFFSET_ARP_OPCODE] == 0x00 &&
@@ -347,19 +368,24 @@ skip_send:
 					memcpy(buf->data + OFFSET_ARP_DST_MAC, rbufs[i]->data + OFFSET_ARP_SRC_MAC, 10);  // 6 mac + 4 IP
 
                       for (uint32_t pcur = 0; pcur < buf->size; pcur++) {
-                              printf("%02x", (buf->data)[pcur]);
+                              fprintf(stderr, "%02x", (buf->data)[pcur]);
                       }
-                      printf("\n");
+                      fprintf(stderr, "\n");
 					ixy_tx_batch_busy_wait(dev, 0, &buf, 1);
 				   } else if (
 					pkt_minebymac && 
                                         rbufs[i]->data[OFFSET_IP_PROTO] == 0x06 &&
                                         rbufs[i]->data[OFFSET_TCP_FLAGS] == 0x12
                                    ) {
-                                  	printf("%03d.%03d.%03d.%03d\n", rbufs[i]->data[OFFSET_TCP_SRC_IP],
+					printf("%d.%d.%d.%d\n", rbufs[i]->data[OFFSET_TCP_SRC_IP],
                                         rbufs[i]->data[OFFSET_TCP_SRC_IP +1],
                                         rbufs[i]->data[OFFSET_TCP_SRC_IP +2],
                                         rbufs[i]->data[OFFSET_TCP_SRC_IP+3]);
+//                      for (uint32_t pcur = 0; pcur < rbufs[i]->size; pcur++) {
+//                              printf("%02x", (rbufs[i]->data)[pcur]);
+//                      }
+//                      printf("\n");
+
 
 				   }
 			}
